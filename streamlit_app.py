@@ -16,7 +16,7 @@ except Exception:
 # =============================
 # App Setup
 # =============================
-st.set_page_config(page_title="🚀 ShubhStocks: Smarter India Tracker", page_icon="💹", layout="wide")
+st.set_page_config(page_title="🚀 Smarter India Tracker", page_icon="💹", layout="wide")
 st.title("🚀Smarter India Tracker ")
 st.caption("Built by Shubh • 20 standout features")
 
