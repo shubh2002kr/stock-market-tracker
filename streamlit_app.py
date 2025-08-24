@@ -3,38 +3,39 @@ import datetime as dt
 import pandas as pd
 import numpy as np
 import yfinance as yf
+import math
 from io import StringIO
 
-# Try Plotly; fall back if not present
+# Optional: Plotly for rich charts
 try:
     import plotly.express as px
     import plotly.graph_objects as go
 except Exception:
     px, go = None, None
 
-# -----------------------------
+# =============================
 # App Setup
-# -----------------------------
-st.set_page_config(page_title="📈 Indian Stock Tracker ", page_icon="🇮🇳", layout="wide")
-st.title("📈 S.H.U.B.H. India Stock Tracker")
-st.caption("Smart Hub for Understanding Business Holdings (India)")
-st.write("Track **NSE/BSE** stocks with Yahoo Finance data, compare performance, analyze risk, and download results.")
+# =============================
+st.set_page_config(page_title="🚀 ShubhStocks: Smarter India Tracker", page_icon="💹", layout="wide")
+st.title("🚀Smarter India Tracker ")
+st.caption("Built by Shubh • 20 standout features")
 
-# -----------------------------
-# Helpers
-# -----------------------------
+# =============================
+# Helpers & Data
+# =============================
+
 def add_suffix(symbol: str, sfx: str) -> str:
     if symbol.endswith(".NS") or symbol.endswith(".BO"):
         return symbol
     return f"{symbol}{sfx}"
 
 @st.cache_data(show_spinner=False)
-def fetch_history(tickers_full, start, end, interval="1d"):
-    """Download adjusted close for each ticker into a single DataFrame."""
+def fetch_history_close(tickers_full, start, end, interval="1d", auto_adjust=True):
+    """Adjusted Close panel for multi-asset analytics."""
     frames = []
     for full in tickers_full:
         try:
-            hist = yf.Ticker(full).history(start=start, end=end, interval=interval, auto_adjust=True, actions=False)
+            hist = yf.Ticker(full).history(start=start, end=end, interval=interval, auto_adjust=auto_adjust, actions=False)
             if not hist.empty and "Close" in hist.columns:
                 root = full.replace(".NS", "").replace(".BO", "")
                 frames.append(hist["Close"].rename(root))
@@ -47,12 +48,20 @@ def fetch_history(tickers_full, start, end, interval="1d"):
     return data
 
 @st.cache_data(show_spinner=False)
+def fetch_history_ohlc(ticker_full, start, end, interval="1d", auto_adjust=True):
+    try:
+        hist = yf.Ticker(ticker_full).history(start=start, end=end, interval=interval, auto_adjust=auto_adjust, actions=False)
+        if not hist.empty:
+            hist.index.name = "Date"
+        return hist
+    except Exception:
+        return pd.DataFrame()
+
+@st.cache_data(show_spinner=False)
 def fast_fundamentals(full_symbol: str):
-    """Lightweight fundamentals from yfinance fast_info (cached)."""
     try:
         t = yf.Ticker(full_symbol)
         fi = getattr(t, "fast_info", {})
-        # 52w metrics may be None depending on ticker support
         return {
             "currency": getattr(fi, "currency", None) if hasattr(fi, "currency") else (fi.get("currency") if isinstance(fi, dict) else None),
             "market_cap": getattr(fi, "market_cap", None) if hasattr(fi, "market_cap") else (fi.get("market_cap") if isinstance(fi, dict) else None),
@@ -63,341 +72,433 @@ def fast_fundamentals(full_symbol: str):
     except Exception:
         return {}
 
-def compute_indicators(prices: pd.Series) -> pd.DataFrame:
-    df = prices.to_frame("Close").copy()
-    df["SMA20"] = df["Close"].rolling(20).mean()
-    df["SMA50"] = df["Close"].rolling(50).mean()
-    df["SMA200"] = df["Close"].rolling(200).mean()
-    # RSI(14)
-    delta = df["Close"].diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = (-delta.clip(upper=0)).rolling(14).mean()
-    rs = gain / (loss.replace(0, np.nan))
-    df["RSI14"] = 100 - (100 / (1 + rs))
-    return df
+# =============================
+# Yahoo Finance Presets (stay Yahoo-only)
+# =============================
+@st.cache_data(show_spinner=True)
+def load_yahoo_presets():
+    presets = {"NIFTY50": [], "NIFTYBANK": []}
+    try:
+        presets["NIFTY50"] = [s.replace(".NS", "") for s in yf.tickers_nifty50()]
+    except Exception:
+        pass
+    try:
+        presets["NIFTYBANK"] = [s.replace(".NS", "") for s in yf.tickers_niftybank()]
+    except Exception:
+        pass
+    return presets
 
-def perf_stats(series: pd.Series, freq_per_year=252):
-    """Return, CAGR, vol, max DD, Sharpe (rf=0)."""
-    series = series.dropna()
-    if series.empty:
-        return None
-    ret = series.pct_change().dropna()
-    # CAGR
-    days = (series.index[-1] - series.index[0]).days
-    if days <= 0:
-        cagr = np.nan
-    else:
-        cagr = (series.iloc[-1] / series.iloc[0]) ** (365.25 / days) - 1
-    vol = ret.std() * np.sqrt(freq_per_year)
-    # Max Drawdown
-    roll_max = series.cummax()
-    dd = series / roll_max - 1.0
-    max_dd = dd.min()
-    sharpe = (ret.mean() * freq_per_year) / vol if vol and not np.isnan(vol) and vol != 0 else np.nan
-    total = series.iloc[-1] / series.iloc[0] - 1
-    return {"Return": total, "CAGR": cagr, "Volatility": vol, "MaxDD": max_dd, "Sharpe": sharpe}
+PRESETS = load_yahoo_presets()
 
-def to_pct(x):
-    return f"{x*100:,.2f}%" if pd.notnull(x) else "—"
+# =============================
+# Sidebar — Universe & Dates
+# =============================
+st.sidebar.header("⭐ Universe & Controls")
+if PRESETS.get("NIFTY50"):
+    st.sidebar.success(f"NIFTY 50 loaded: {len(PRESETS['NIFTY50'])}")
+if PRESETS.get("NIFTYBANK"):
+    st.sidebar.info(f"NIFTY BANK loaded: {len(PRESETS['NIFTYBANK'])}")
 
-def resample_prices(df: pd.DataFrame, mode: str):
-    if mode == "Daily":
-        return df
-    if mode == "Weekly":
-        return df.resample("W-FRI").last()
-    if mode == "Monthly":
-        return df.resample("M").last()
-    return df
-
-# -----------------------------
-# Sidebar
-# -----------------------------
-st.sidebar.header("📊 Stock Selection")
-
-# Exchange toggle
 exchange = st.sidebar.radio("Exchange", ["NSE (.NS)", "BSE (.BO)"], index=0)
 suffix = ".NS" if "NSE" in exchange else ".BO"
 
-# Built-in populars
-POPULAR = [
-    "RELIANCE","TCS","HDFCBANK","ICICIBANK","INFY","KOTAKBANK","SBIN",
-    "LT","ITC","HINDUNILVR","BHARTIARTL","ASIANPAINT","AXISBANK","MARUTI",
-    "BAJFINANCE","WIPRO","NTPC","POWERGRID","ULTRACEMCO","HCLTECH",
-    "TATAMOTORS","TATASTEEL","ADANIENT","ADANIPORTS","SUNPHARMA",
-    "ONGC","COALINDIA","INDUSINDBK","NESTLEIND","BAJAJFINSV"
-]
+preset_universe = sorted(set(PRESETS.get("NIFTY50", []) + PRESETS.get("NIFTYBANK", [])))
+manual_add = st.sidebar.text_input("Add symbols (comma-separated, e.g., RELIANCE, TCS, SBIN)", value="")
+file_up = st.sidebar.file_uploader("…or upload a CSV with a 'symbol' column", type=["csv"], key="user_csv")
 
-# Presets from yfinance (NIFTY)
-with st.sidebar.expander("⭐ Quick Presets"):
-    colp1, colp2 = st.columns(2)
-    preset_choice = None
-    if colp1.button("NIFTY 50"):
-        try:
-            preset_choice = [s.replace(".NS","") for s in yf.tickers_nifty50()]
-        except Exception:
-            st.warning("Could not fetch NIFTY 50. Using popular list.")
-            preset_choice = POPULAR
-    if colp2.button("NIFTY BANK"):
-        try:
-            preset_choice = [s.replace(".NS","") for s in yf.tickers_niftybank()]
-        except Exception:
-            st.warning("Could not fetch NIFTY BANK.")
+user_syms = []
+if file_up is not None:
+    try:
+        dfu = pd.read_csv(file_up)
+        if "symbol" in dfu.columns:
+            user_syms = [str(s).upper().strip() for s in dfu["symbol"].dropna().unique().tolist()]
+    except Exception:
+        pass
+if manual_add.strip():
+    user_syms.extend([s.strip().upper() for s in manual_add.split(",") if s.strip()])
 
-# Upload master list (to include ALL listed companies)
-with st.sidebar.expander("📥 Import Full Symbol List (Optional)"):
-    st.write("Upload a CSV with columns: **symbol** (required), optional **name**, **exchange**.")
-    uploaded = st.file_uploader("Upload CSV", type=["csv"])
-    url_input = st.text_input("...or paste CSV URL (raw GitHub/CSV endpoint)", value="")
-    imported_symbols = []
-    if uploaded is not None:
-        try:
-            df_imp = pd.read_csv(uploaded)
-            if "symbol" in df_imp.columns:
-                imported_symbols = [str(s).upper() for s in df_imp["symbol"].dropna().unique().tolist()]
-            else:
-                st.error("CSV must contain a 'symbol' column.")
-        except Exception as e:
-            st.error(f"Failed to read uploaded CSV: {e}")
-    elif url_input.strip():
-        try:
-            # NOTE: pandas can read many HTTP CSVs; this will run only when the app is deployed.
-            df_imp = pd.read_csv(url_input.strip())
-            if "symbol" in df_imp.columns:
-                imported_symbols = [str(s).upper() for s in df_imp["symbol"].dropna().unique().tolist()]
-            else:
-                st.error("Remote CSV must contain a 'symbol' column.")
-        except Exception as e:
-            st.error(f"Failed to fetch CSV from URL: {e}")
+ALL_COMPANIES = sorted(set(preset_universe + user_syms))
 
-# Main selection list
-base_options = sorted(set(POPULAR + (preset_choice or []) + imported_symbols))
-if not base_options:
-    base_options = POPULAR
-
-DEFAULT_TICKERS = ["RELIANCE","TCS","HDFCBANK","ICICIBANK"]
-if preset_choice:
-    DEFAULT_TICKERS = preset_choice[:6] if len(preset_choice) >= 6 else preset_choice
-
-tickers_root = st.sidebar.multiselect(
-    "Select Stocks to Compare",
-    options=base_options,
-    default=[t for t in DEFAULT_TICKERS if t in base_options],
-    help="Symbols without suffix; app adds .NS/.BO automatically."
-)
-
-# Free-text add
-extra = st.sidebar.text_input("Add more (comma-separated, e.g., INFY, SBIN)", value="")
-if extra.strip():
-    tickers_root.extend([e.strip().upper() for e in extra.split(",") if e.strip()])
-
-# De-duplicate while preserving order
-seen = set()
-tickers_root = [x for x in tickers_root if not (x in seen or seen.add(x))]
-
-# Dates, interval & resampling
 start_date = st.sidebar.date_input("Start Date", dt.date(2024, 1, 1))
 end_date = st.sidebar.date_input("End Date", dt.date.today())
-interval = st.sidebar.selectbox("Data Interval", ["1d","1wk","1mo"], index=0)
-resample_mode = st.sidebar.selectbox("Resample To", ["Daily","Weekly","Monthly"], index=0)
+interval = st.sidebar.selectbox("Interval", ["1d", "1wk", "1mo"], index=0)
+auto_adjust = st.sidebar.toggle("Use Adjusted Prices", value=True, help="Turn off to see raw OHLC without split/dividend adjustments")
 
-# Portfolio weights setting
-with st.sidebar.expander("🎯 Portfolio Weights"):
-    weight_mode = st.radio("Weighting", ["Equal Weight", "Custom Weights"], index=0)
-    custom_weights = {}
-    if weight_mode == "Custom Weights" and tickers_root:
-        for t in tickers_root:
-            custom_weights[t] = st.slider(f"{t} %", 0, 100, 0, step=1)
-        total_w = sum(custom_weights.values())
-        st.caption(f"Total: **{total_w}%** (auto-normalized if ≠ 100%)")
+selected_symbols = st.sidebar.multiselect("Select companies", ALL_COMPANIES[:800], ALL_COMPANIES[:6] if ALL_COMPANIES else [])
 
-# -----------------------------
-# Main
-# -----------------------------
+# =============================
+# Guards
+# =============================
 if start_date > end_date:
     st.error("⚠️ Start date must be before end date.")
-elif not tickers_root:
-    st.warning("Please select at least one stock.")
-else:
-    suffix_label = "NSE" if suffix == ".NS" else "BSE"
-    full = [add_suffix(t, suffix) for t in tickers_root]
+    st.stop()
+if not selected_symbols:
+    st.warning("Select at least one symbol from the sidebar.")
+    st.stop()
 
-    with st.spinner(f"Fetching data from Yahoo Finance ({suffix_label})..."):
-        data_raw = fetch_history(full, start_date, end_date, interval=interval)
+full = [add_suffix(t, suffix) for t in selected_symbols]
 
-    if data_raw.empty:
-        st.error("No data returned. Try different symbols, exchange, or date range.")
+# =============================
+# Core Data Loads
+# =============================
+with st.spinner("Fetching price data from Yahoo Finance…"):
+    prices = fetch_history_close(full, start_date, end_date, interval=interval, auto_adjust=auto_adjust)
+
+if prices.empty:
+    st.error("No data returned. Try different symbols/date range.")
+    st.stop()
+
+rets = prices.pct_change().dropna(how="all")
+
+# =============================
+# Tabs for 20 Differentiator Features
+# =============================
+T1, T2, T3, T4, T5 = st.tabs([
+    "1) Price & Patterns",
+    "2) Strategies & Alerts",
+    "3) Risk & Portfolio",
+    "4) Fundamentals & Events",
+    "5) Options, Dividends & Reports",
+])
+
+# -------------------------------------------------
+# 1) Price & Patterns (OHLC, Candles, Heatmaps, Network)
+# -------------------------------------------------
+with T1:
+    st.subheader("1) Multi-asset Price View + Novel Visuals")
+    if px:
+        df_prices = prices.reset_index().melt(id_vars="Date", var_name="Ticker", value_name="Price")
+        fig = px.line(df_prices, x="Date", y="Price", color="Ticker", title="Prices Over Time")
+        st.plotly_chart(fig, use_container_width=True)
     else:
-        # Optional resampling
-        data = resample_prices(data_raw, resample_mode)
+        st.line_chart(prices)
 
-        # Toggle raw preview
-        with st.expander("📄 Raw Data Preview"):
-            st.dataframe(data.tail(20))
+    st.markdown("**Candlestick + Auto Pattern Detection (per ticker)**")
+    sel_ta = st.selectbox("Pick a ticker", selected_symbols, index=0, key="ta_ohlc")
+    ohlc = fetch_history_ohlc(add_suffix(sel_ta, suffix), start_date, end_date, interval=interval, auto_adjust=auto_adjust)
+    if not ohlc.empty and go is not None:
+        candle = go.Figure(data=[go.Candlestick(x=ohlc.index, open=ohlc["Open"], high=ohlc["High"], low=ohlc["Low"], close=ohlc["Close"], name=sel_ta)])
+        candle.update_layout(title=f"{sel_ta} — OHLC", xaxis_title="Date", yaxis_title="Price")
+        st.plotly_chart(candle, use_container_width=True)
 
-        # ----------------- Price chart with SMAs/RSI per selected (single or multiple) -----------------
-        st.subheader(f"💹 Price Chart ({suffix_label}) — {resample_mode}")
-        df_prices = data.reset_index().melt(id_vars="Date", var_name="Ticker", value_name="Price")
+        # Simple pattern: Bullish/Bearish Engulfing & Doji
+        body = (ohlc["Close"] - ohlc["Open"]).abs()
+        range_ = (ohlc["High"] - ohlc["Low"]).replace(0, np.nan)
+        doji = (body / range_) < 0.1
+        prev = ohlc.shift(1)
+        bull_engulf = (ohlc["Close"] > ohlc["Open"]) & (prev["Close"] < prev["Open"]) & (ohlc["Close"] >= prev["Open"]) & (ohlc["Open"] <= prev["Close"])
+        bear_engulf = (ohlc["Close"] < ohlc["Open"]) & (prev["Close"] > prev["Open"]) & (ohlc["Close"] <= prev["Open"]) & (ohlc["Open"] >= prev["Close"])
+        last_marks = pd.DataFrame({"Doji": doji, "BullEngulf": bull_engulf, "BearEngulf": bear_engulf}).dropna(how="all").tail(10)
+        st.dataframe(last_marks[last_marks.any(axis=1)].tail(10))
 
-        if px:
-            fig = px.line(df_prices, x="Date", y="Price", color="Ticker",
-                          title=f"Stock Prices Over Time ({suffix_label})",
-                          labels={"Price": "Price (INR)", "Ticker": "Ticker"})
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.line_chart(data)
-
-        # Technicals (per-ticker)
-        with st.expander("🧪 Technical Indicators (SMA 20/50/200, RSI 14)"):
-            sel_for_ta = st.selectbox("Choose ticker for indicators", tickers_root)
-            ta_series = data[sel_for_ta].dropna()
-            indi = compute_indicators(ta_series)
-
-            if px:
-                fig_ta = go.Figure()
-                fig_ta.add_trace(go.Scatter(x=indi.index, y=indi["Close"], mode="lines", name="Close"))
-                fig_ta.add_trace(go.Scatter(x=indi.index, y=indi["SMA20"], mode="lines", name="SMA20"))
-                fig_ta.add_trace(go.Scatter(x=indi.index, y=indi["SMA50"], mode="lines", name="SMA50"))
-                fig_ta.add_trace(go.Scatter(x=indi.index, y=indi["SMA200"], mode="lines", name="SMA200"))
-                fig_ta.update_layout(title=f"{sel_for_ta} — Price & SMAs", xaxis_title="Date", yaxis_title="Price (INR)")
-                st.plotly_chart(fig_ta, use_container_width=True)
-
-                fig_rsi = go.Figure()
-                fig_rsi.add_trace(go.Scatter(x=indi.index, y=indi["RSI14"], mode="lines", name="RSI14"))
-                fig_rsi.add_hline(y=70, line_dash="dot")
-                fig_rsi.add_hline(y=30, line_dash="dot")
-                fig_rsi.update_layout(title=f"{sel_for_ta} — RSI(14)", xaxis_title="Date", yaxis_title="RSI")
-                st.plotly_chart(fig_rsi, use_container_width=True)
-            else:
-                st.line_chart(indi[["Close","SMA20","SMA50","SMA200"]])
-                st.line_chart(indi[["RSI14"]])
-
-        # ----------------- Normalized comparison -----------------
-        st.subheader("📊 Normalized Stock Comparison (Relative Growth)")
-        normalized = data / data.iloc[0] * 100
-        df_norm = normalized.reset_index().melt(id_vars="Date", var_name="Ticker", value_name="Growth")
-        if px:
-            fig2 = px.line(df_norm, x="Date", y="Growth", color="Ticker",
-                           title="Normalized Comparison (100 = first day)",
-                           labels={"Growth": "Growth (Index)", "Ticker": "Ticker"})
-            st.plotly_chart(fig2, use_container_width=True)
-        else:
-            st.line_chart(normalized)
-
-        # ----------------- Performance table -----------------
-        st.subheader("📈 Performance Metrics")
-        freq = 252 if resample_mode == "Daily" else (52 if resample_mode == "Weekly" else 12)
-        rows = []
-        for t in data.columns:
-            stats = perf_stats(data[t], freq_per_year=freq)
-            if stats:
-                rows.append({
-                    "Ticker": t,
-                    "Total Return": stats["Return"],
-                    "CAGR": stats["CAGR"],
-                    "Volatility": stats["Volatility"],
-                    "Max Drawdown": stats["MaxDD"],
-                    "Sharpe": stats["Sharpe"],
-                })
-        perf_df = pd.DataFrame(rows).set_index("Ticker")
-        fmt = perf_df.applymap(lambda x: to_pct(x) if isinstance(x, (int,float,np.floating)) else x)
-        st.dataframe(fmt)
-
-        # ----------------- Correlation heatmap -----------------
-        st.subheader("🔗 Correlation (Daily Returns)")
-        rets = data.pct_change().dropna(how="all")
+    st.markdown("**Correlation Heatmap (Returns)**")
+    if px is not None:
         corr = rets.corr().fillna(0)
-        if px:
-            figc = px.imshow(corr, text_auto=True, aspect="auto", title="Return Correlation Matrix")
-            st.plotly_chart(figc, use_container_width=True)
+        st.plotly_chart(px.imshow(corr, text_auto=True, aspect="auto", title="Return Correlation Matrix"), use_container_width=True)
+    else:
+        st.dataframe(rets.corr())
+
+    st.markdown("**Correlation Network (novel)**")
+    thr = st.slider("Edge threshold (|corr|)", 0.0, 1.0, 0.6, 0.05)
+    corr = rets.corr().fillna(0)
+    nodes = corr.columns.tolist()
+    # circular layout
+    theta = np.linspace(0, 2*math.pi, len(nodes), endpoint=False)
+    pos = {n: (math.cos(t), math.sin(t)) for n, t in zip(nodes, theta)}
+    edges = [(i, j, corr.loc[i, j]) for i in nodes for j in nodes if i < j and abs(corr.loc[i, j]) >= thr]
+    if go is not None and edges:
+        edge_traces = []
+        for i, j, w in edges:
+            x0, y0 = pos[i]
+            x1, y1 = pos[j]
+            edge_traces.append(go.Scatter(x=[x0, x1], y=[y0, y1], mode="lines", hoverinfo="none", opacity=min(1, abs(w)), showlegend=False))
+        node_trace = go.Scatter(x=[pos[n][0] for n in nodes], y=[pos[n][1] for n in nodes], mode="markers+text", text=nodes, textposition="top center")
+        fig_net = go.Figure(data=edge_traces + [node_trace])
+        fig_net.update_layout(title="Correlation Network", xaxis_visible=False, yaxis_visible=False)
+        st.plotly_chart(fig_net, use_container_width=True)
+
+# -------------------------------------------------
+# 2) Strategies & Alerts (Backtests, Rules, Anomalies)
+# -------------------------------------------------
+with T2:
+    st.subheader("2) Strategy Backtests + Smart Alerts")
+
+    st.markdown("**A. Moving Average Crossover Backtest (per ticker)**")
+    ma_ticker = st.selectbox("Ticker", selected_symbols, key="ma_ticker")
+    short_win = st.number_input("Short MA", min_value=5, max_value=200, value=20, step=1)
+    long_win = st.number_input("Long MA", min_value=10, max_value=400, value=50, step=1)
+    p = prices[ma_ticker].dropna()
+    if len(p) > long_win:
+        sma_s = p.rolling(short_win).mean()
+        sma_l = p.rolling(long_win).mean()
+        signal = (sma_s > sma_l).astype(int)
+        strat_rets = p.pct_change().fillna(0) * signal.shift(1).fillna(0)
+        curve = (1 + strat_rets).cumprod()
+        bench = (p / p.iloc[0])
+        if px is not None:
+            st.plotly_chart(px.line(pd.concat([curve.rename("Strategy"), bench.rename("Buy&Hold")], axis=1), title=f"{ma_ticker}: MA({short_win}/{long_win}) Backtest"), use_container_width=True)
+        st.write({"Strategy CAGR": (curve.iloc[-1] ** (365.25 / max(1,(curve.index[-1]-curve.index[0]).days)) - 1) if len(curve)>1 else np.nan})
+
+    st.markdown("**B. RSI Rules & Alerts (per ticker)**")
+    rsi_ticker = st.selectbox("Ticker for RSI", selected_symbols, key="rsi_ticker")
+    p2 = prices[rsi_ticker].dropna()
+    if len(p2) > 15:
+        delta = p2.diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = (-delta.clip(upper=0)).rolling(14).mean()
+        rs = gain / loss.replace(0, np.nan)
+        rsi = 100 - (100 / (1 + rs))
+        overbought = rsi.iloc[-1] >= 70
+        oversold = rsi.iloc[-1] <= 30
+        st.metric("Latest RSI(14)", f"{rsi.iloc[-1]:.2f}", help="Alerts: OB>=70, OS<=30")
+        st.info("Overbought 🚩" if overbought else ("Oversold ✅" if oversold else "Neutral"))
+        if px is not None:
+            st.plotly_chart(px.line(rsi, title=f"{rsi_ticker}: RSI(14)"), use_container_width=True)
+
+    st.markdown("**C. Return Anomalies (Z-Score)**")
+    roll = st.slider("Window (days)", 10, 120, 60)
+    anomalies = {}
+    for c in prices.columns:
+        r = prices[c].pct_change()
+        z = (r - r.rolling(roll).mean()) / (r.rolling(roll).std())
+        if not z.empty and abs(z.iloc[-1]) >= 2:
+            anomalies[c] = float(z.iloc[-1])
+    if anomalies:
+        st.warning(f"Anomaly candidates (|z|≥2): {anomalies}")
+    else:
+        st.caption("No significant anomalies today.")
+
+# -------------------------------------------------
+# 3) Risk & Portfolio (Efficient Frontier, VaR/CVaR, Beta, Monte Carlo)
+# -------------------------------------------------
+with T3:
+    st.subheader("3) Portfolio Analytics & Risk Lab")
+
+    freq = {"1d":252, "1wk":52, "1mo":12}[interval]
+    mu = rets.mean() * freq
+    sigma = rets.cov() * freq
+
+    st.markdown("**A. Efficient Frontier (MPT)**")
+    if len(prices.columns) >= 2 and go is not None:
+        def port_stats(w):
+            w = np.array(w)
+            ret = float(np.dot(w, mu))
+            vol = float(np.sqrt(np.dot(w, np.dot(sigma, w))))
+            sr = ret/vol if vol>0 else np.nan
+            return ret, vol, sr
+        # random portfolios
+        N = 2000
+        Ws = np.random.dirichlet(np.ones(len(mu)), N)
+        pts = np.array([port_stats(w) for w in Ws])
+        figf = go.Figure()
+        figf.add_trace(go.Scatter(x=pts[:,1], y=pts[:,0], mode="markers", name="Random", opacity=0.4))
+        st.plotly_chart(figf.update_layout(title="Efficient Frontier (simulated)", xaxis_title="Volatility", yaxis_title="Return"), use_container_width=True)
+
+    st.markdown("**B. One-click Tangency Portfolio (rf=0)**")
+    if len(prices.columns) >= 2:
+        try:
+            inv = np.linalg.pinv(sigma.values)
+            ones = np.ones(len(mu))
+            w_tan = inv.dot(mu.values)
+            w_tan = w_tan / w_tan.sum()
+            w_series = pd.Series(w_tan, index=mu.index)
+            st.dataframe((w_series*100).round(2).rename("% Weight"))
+        except Exception:
+            st.caption("Could not compute tangency weights.")
+
+    st.markdown("**C. Risk: VaR & CVaR (parametric)**")
+    alpha = st.slider("Confidence", 0.90, 0.99, 0.95, 0.01)
+    port_w = np.array([1/len(prices.columns)]*len(prices.columns))
+    port_rets = (rets * port_w).sum(axis=1)
+    mu_d = port_rets.mean()
+    sd_d = port_rets.std()
+    from scipy.stats import norm
+    var = -(mu_d + sd_d * norm.ppf(1-alpha))
+    cvar = - (mu_d - sd_d * (norm.pdf(norm.ppf(1-alpha))/(1-alpha)))
+    st.write({"Daily VaR": float(var), "Daily CVaR": float(cvar)})
+
+    st.markdown("**D. Beta vs NIFTY 50 (Yahoo ^NSEI)**")
+    try:
+        idx = yf.Ticker("^NSEI").history(start=start_date, end=end_date, interval=interval)["Close"].pct_change().dropna()
+        betas = {}
+        for c in prices.columns:
+            r = prices[c].pct_change().dropna()
+            aligned = pd.concat([r, idx], axis=1).dropna()
+            if len(aligned)>5:
+                cov = np.cov(aligned.iloc[:,0], aligned.iloc[:,1])[0,1]
+                betas[c] = float(cov / aligned.iloc[:,1].var()) if aligned.iloc[:,1].var()!=0 else np.nan
+        st.dataframe(pd.Series(betas, name="Beta vs ^NSEI"))
+    except Exception:
+        st.caption("Index fetch failed; beta unavailable.")
+
+    st.markdown("**E. Monte Carlo (GBM) — per ticker**")
+    mc_t = st.selectbox("Ticker for MC", prices.columns, key="mc_t")
+    sims = st.slider("Simulations", 100, 2000, 500, 100)
+    horizon = st.slider("Days ahead", 30, 365, 180, 15)
+    series = prices[mc_t].dropna()
+    if len(series)>5:
+        r = series.pct_change().dropna()
+        mu_g = r.mean()
+        sd_g = r.std()
+        last = series.iloc[-1]
+        rnd = np.random.normal(mu_g, sd_g, (horizon, sims))
+        path = last * (1 + rnd).cumprod(axis=0)
+        mean_path = path.mean(axis=1)
+        if px is not None:
+            st.plotly_chart(px.line(pd.DataFrame({"Mean": mean_path})), use_container_width=True)
+        st.caption("Simple GBM-style simulation for indicative ranges.")
+
+# -------------------------------------------------
+# 4) Fundamentals & Events (Comparatives, Calendar, Sector Rotation)
+# -------------------------------------------------
+with T4:
+    st.subheader("4) Fundamentals & Corporate Events")
+
+    st.markdown("**A. Quick Fundamentals Glance**")
+    cols = st.columns(min(4, len(full)))
+    for i, root in enumerate(prices.columns[:8]):
+        full_sym = add_suffix(root, suffix)
+        fi = fast_fundamentals(full_sym)
+        with cols[i % len(cols)]:
+            st.markdown(f"**{root}**  ")
+            st.caption(full_sym)
+            st.write(f"Last: {fi.get('last_price', '—')} {fi.get('currency','INR') or 'INR'}")
+            st.write(f"52w: {fi.get('year_low','—')} — {fi.get('year_high','—')}")
+            mc = fi.get('market_cap')
+            st.write(f"Mkt Cap: {f'{mc:,.0f}' if isinstance(mc,(int,float)) else '—'}")
+
+    st.markdown("**B. Events Calendar (earnings, dividends, splits) — per ticker**")
+    ev_t = st.selectbox("Ticker for events", prices.columns, key="events_t")
+    T = yf.Ticker(add_suffix(ev_t, suffix))
+    try:
+        div = T.dividends
+    except Exception:
+        div = pd.Series(dtype=float)
+    try:
+        splits = T.splits
+    except Exception:
+        splits = pd.Series(dtype=float)
+    try:
+        cal = T.calendar if hasattr(T, 'calendar') else pd.DataFrame()
+    except Exception:
+        cal = pd.DataFrame()
+    st.write("Dividends (recent):")
+    st.dataframe(div.tail(10))
+    st.write("Splits (recent):")
+    st.dataframe(splits.tail(10))
+    if isinstance(cal, pd.DataFrame) and not cal.empty:
+        st.write("Upcoming/Recent earnings calendar (if available):")
+        st.dataframe(cal)
+    else:
+        st.caption("No earnings calendar data available.")
+
+    st.markdown("**C. Sector Rotation Snapshot (best effort)**")
+    st.caption("Yahoo fast_info may not expose sectors consistently; this is a best-effort grouping if available via .info.")
+    sectors = []
+    for root in prices.columns:
+        try:
+            info = yf.Ticker(add_suffix(root, suffix)).info
+            sectors.append({"Ticker": root, "Sector": info.get("sector", "Unknown")})
+        except Exception:
+            sectors.append({"Ticker": root, "Sector": "Unknown"})
+    sec_df = pd.DataFrame(sectors)
+    st.dataframe(sec_df)
+    if not sec_df.empty:
+        perf = (prices.iloc[-1] / prices.iloc[0] - 1).rename("Return")
+        sec_perf = sec_df.set_index("Ticker").join(perf).groupby("Sector").mean().sort_values("Return", ascending=False)
+        if px is not None:
+            st.plotly_chart(px.bar(sec_perf, y="Return", title="Sector Rotation (avg return)").update_layout(yaxis_tickformat=",.0%"), use_container_width=True)
         else:
-            st.dataframe(corr)
+            st.dataframe(sec_perf)
 
-        # ----------------- Portfolio backtest -----------------
-        st.subheader("🧺 Portfolio Backtest")
-        if not rets.empty:
-            if weight_mode == "Equal Weight":
-                w = np.array([1/len(data.columns)] * len(data.columns))
-            else:
-                # normalize custom weights; if all zero -> equal
-                cw = np.array([custom_weights.get(t, 0) for t in data.columns], dtype=float)
-                if cw.sum() == 0:
-                    w = np.array([1/len(data.columns)] * len(data.columns))
-                else:
-                    w = cw / cw.sum()
-            port_rets = (rets * w).sum(axis=1)
-            port_curve = (1 + port_rets).cumprod()
+# -------------------------------------------------
+# 5) Options, Dividends & Export (Chain, Yield, Custom Index)
+# -------------------------------------------------
+with T5:
+    st.subheader("5) Derivatives, Income & Reports")
 
-            if px:
-                figp = px.line(port_curve, title="Portfolio Cumulative Growth (Base = 1.0)")
-                st.plotly_chart(figp, use_container_width=True)
-            else:
-                st.line_chart(port_curve)
+    st.markdown("**A. Options Chain (if Yahoo provides it)**")
+    opt_t = st.selectbox("Ticker for options", prices.columns, key="opt_t")
+    try:
+        tk = yf.Ticker(add_suffix(opt_t, suffix))
+        exps = tk.options
+        if exps:
+            exp = st.selectbox("Expiry", exps, index=0)
+            ch = tk.option_chain(exp)
+            st.write("Calls:")
+            st.dataframe(ch.calls.head(50))
+            st.write("Puts:")
+            st.dataframe(ch.puts.head(50))
+        else:
+            st.caption("No options data available for this symbol.")
+    except Exception:
+        st.caption("Options retrieval failed.")
 
-            # Portfolio quick stats
-            ps = perf_stats((port_curve * 100).rename("Px"), freq_per_year=freq)  # scale doesn't matter
-            colA, colB, colC, colD = st.columns(4)
-            colA.metric("Total Return", to_pct(ps["Return"]) if ps else "—")
-            colB.metric("CAGR", to_pct(ps["CAGR"]) if ps else "—")
-            colC.metric("Volatility", to_pct(ps["Volatility"]) if ps else "—")
-            colD.metric("Sharpe", f"{ps['Sharpe']:.2f}" if ps and pd.notnull(ps["Sharpe"]) else "—")
+    st.markdown("**B. Dividend Tracker & Yield**")
+    div_t = st.selectbox("Ticker for dividends", prices.columns, key="div_t")
+    try:
+        dser = yf.Ticker(add_suffix(div_t, suffix)).dividends
+        if isinstance(dser, pd.Series) and not dser.empty:
+            last_year = dser[dser.index >= (dser.index.max() - pd.Timedelta(days=365))].sum()
+            last_price = prices[div_t].iloc[-1]
+            yield_est = float(last_year / last_price) if last_price and last_year else np.nan
+            st.write({"12m Dividends": float(last_year), "Approx Yield": yield_est})
+            if px is not None:
+                st.plotly_chart(px.bar(dser.tail(20), title=f"{div_t}: Dividend History"), use_container_width=True)
+        else:
+            st.caption("No dividend data.")
+    except Exception:
+        st.caption("Dividend fetch failed.")
 
-            # Download portfolio series
-            st.download_button(
-                "⬇️ Download Portfolio Curve (CSV)",
-                data=port_curve.rename("Portfolio").to_csv(index=True).encode("utf-8"),
-                file_name=f"portfolio_curve_{suffix_label}.csv",
-                mime="text/csv",
-            )
+    st.markdown("**C. Custom Index Builder & Export**")
+    st.caption("Create your own weighted index and backtest instantly.")
+    weights = {}
+    cols = st.columns(min(4, len(prices.columns)))
+    for i, c in enumerate(prices.columns):
+        with cols[i % len(cols)]:
+            weights[c] = st.number_input(f"{c} %", min_value=0.0, max_value=100.0, value=round(100.0/len(prices.columns), 2))
+    w = np.array([weights[c] for c in prices.columns])
+    if w.sum() == 0:
+        w = np.array([1/len(prices.columns)]*len(prices.columns))
+    else:
+        w = w / w.sum()
+    port_curve = (1 + (rets * w).sum(axis=1)).cumprod()
+    if px is not None:
+        st.plotly_chart(px.line(port_curve, title="Custom Index (Base=1.0)"), use_container_width=True)
+    st.download_button("⬇️ Download Custom Index CSV", data=port_curve.rename("CustomIndex").to_csv().encode("utf-8"), file_name="custom_index.csv", mime="text/csv")
 
-        # ----------------- Fundamentals glance -----------------
-        st.subheader("🏢 Fundamentals (Quick)")
-        cols = st.columns(min(4, len(tickers_root)))
-        for i, t in enumerate(tickers_root[:8]):  # show first up to 8 to keep UI tidy
-            full_sym = add_suffix(t, suffix)
-            fi = fast_fundamentals(full_sym)
-            with cols[i % len(cols)]:
-                st.markdown(f"**{t}**")
-                st.caption(f"{full_sym}")
-                if fi:
-                    mc = fi.get("market_cap")
-                    yrh = fi.get("year_high")
-                    yrl = fi.get("year_low")
-                    lp = fi.get("last_price")
-                    cur = fi.get("currency","INR") or "INR"
-                    st.write(f"Last: {lp if lp is not None else '—'} {cur}")
-                    st.write(f"52w: {yrl if yrl is not None else '—'} — {yrh if yrh is not None else '—'}")
-                    st.write(f"Market Cap: {f'{mc:,.0f}' if isinstance(mc,(int,float)) else '—'}")
-                else:
-                    st.write("—")
+# =============================
+# Extras Section — Unique Add-ons
+# =============================
+with st.expander("📦 Extras: Save/Load Watchlist, Monthly Heatmap, Rolling Metrics"):
+    st.markdown("**Save current selection as watchlist**")
+    csv_buf = StringIO()
+    pd.DataFrame({"symbol": selected_symbols}).to_csv(csv_buf, index=False)
+    st.download_button("Save watchlist CSV", data=csv_buf.getvalue(), file_name="watchlist.csv")
 
-        # ----------------- Downloads -----------------
-        st.subheader("⬇️ Downloads")
-        st.download_button(
-            label="Prices CSV",
-            data=data.to_csv(index=True).encode("utf-8"),
-            file_name=f"prices_{suffix_label}.csv",
-            mime="text/csv",
-        )
-        st.download_button(
-            label="Normalized CSV",
-            data=normalized.to_csv(index=True).encode("utf-8"),
-            file_name=f"normalized_{suffix_label}.csv",
-            mime="text/csv",
-        )
+    st.markdown("**Monthly Return Heatmap**")
+    monthly = prices.resample("M").last().pct_change()
+    if not monthly.empty:
+        mh = monthly.copy()
+        mh.index = mh.index.strftime("%Y-%m")
+        if px is not None:
+            st.plotly_chart(px.imshow(mh.T, aspect="auto", title="Monthly Returns", color_continuous_scale="RdBu_r"), use_container_width=True)
+        else:
+            st.dataframe(mh)
 
-# -----------------------------
-# Tips (collapsible)
-# -----------------------------
-with st.expander("ℹ️ Tips & Notes"):
-    st.markdown(
-        """
-- Use **NSE (.NS)** for most Indian symbols (e.g., `RELIANCE.NS`, `TCS.NS`, `SBIN.NS`).  
-- Use **BSE (.BO)** if you prefer BSE listings.  
-- **All listed companies**: upload a CSV master list (column `symbol`) under *Import Full Symbol List*.  
-  - You can export this from your internal database, a broker download, or a public CSV (raw GitHub).  
-- Presets: **NIFTY 50** and **NIFTY BANK** buttons auto-fill common indices (via Yahoo Finance).  
-- Indicators: open *Technical Indicators* to view SMA20/50/200 & RSI(14).  
-- Portfolio: choose **Equal** or **Custom** weights; values auto-normalize if they don’t add to 100%.  
-- Data source: Yahoo Finance; INR quotes for Indian tickers when available.  
-"""
-    )
+    st.markdown("**Rolling Sharpe & Max Drawdown (equal-weight portfolio)**")
+    eq = (rets.mean(axis=1))
+    roll = 63
+    roll_ret = eq.rolling(roll).mean() * 252
+    roll_vol = eq.rolling(roll).std() * np.sqrt(252)
+    rsh = (roll_ret / roll_vol).replace([np.inf, -np.inf], np.nan)
+    curve = (1 + eq).cumprod()
+    dd = curve / curve.cummax() - 1
+    if px is not None:
+        st.plotly_chart(px.line(rsh, title="Rolling Sharpe (~3 months)"), use_container_width=True)
+        st.plotly_chart(px.line(dd, title="Drawdown (Equal-weight)"), use_container_width=True)
+    else:
+        st.line_chart(rsh)
+        st.line_chart(dd)
+
+st.success("Loaded 20+ distinctive analytics and tools. All data sourced from Yahoo Finance via yfinance. Some fundamentals/events may be unavailable for certain tickers.")
