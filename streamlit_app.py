@@ -1,504 +1,475 @@
-import streamlit as st
-import datetime as dt
-import pandas as pd
-import numpy as np
-import yfinance as yf
-import math
+# Indian Stock Market Tracker — Streamlit App
+# All NSE companies + Beautiful UI + Smart Google Market News (always visible)
+# Built by Shubh Kumar
+
+import io
+import re
+from html import unescape
+from datetime import datetime, timedelta, timezone
 from io import StringIO
+from urllib.parse import quote_plus
+from email.utils import parsedate_to_datetime
+import xml.etree.ElementTree as ET
 
-# Optional: Plotly for rich charts
-try:
-    import plotly.express as px
-    import plotly.graph_objects as go
-except Exception:
-    px, go = None, None
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import requests
+import streamlit as st
+import yfinance as yf
 
-# =============================
-# App Setup
-# =============================
-st.set_page_config(page_title="🚀 Smarter India Tracker", page_icon="💹", layout="wide")
-st.title("🚀Smarter India Tracker ")
-st.caption("Built by Shubh • 20 standout features")
+# -------------------------
+# Page Config + Global Styles
+# -------------------------
+st.set_page_config(
+    page_title="Indian Stock Market Tracker",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-# =============================
-# Helpers & Data
-# =============================
+st.markdown("""
+<style>
+:root{
+  --bg: #0b1020;
+  --card: rgba(255,255,255,0.06);
+  --card-hover: rgba(255,255,255,0.10);
+  --border: rgba(255,255,255,0.15);
+  --text: #e9edf5;
+  --muted: #a7b0c0;
+  --brand1: #5b8cff;
+  --brand2: #6be6b5;
+  --accent: #ffd166;
+}
 
-def add_suffix(symbol: str, sfx: str) -> str:
-    if symbol.endswith(".NS") or symbol.endswith(".BO"):
-        return symbol
-    return f"{symbol}{sfx}"
+html, body, [class^="stApp"]{
+  background: radial-gradient(1200px 600px at 10% -10%, #18233d 10%, transparent 50%) no-repeat,
+              radial-gradient(900px 500px at 110% -20%, #0d3a2d 5%, transparent 50%) no-repeat,
+              linear-gradient(180deg, #0a0f1f 0%, #0b1020 100%) !important;
+}
+
+.app-hero{
+  background: linear-gradient(135deg, rgba(91,140,255,.25), rgba(107,230,181,.15));
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  padding: 18px 22px;
+  box-shadow: 0 10px 30px rgba(0,0,0,.25);
+}
+.app-title{ font-size: 1.9rem; font-weight: 800; color: var(--text); letter-spacing:.25px; }
+.subtitle{ color: var(--muted); }
+
+.card{
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 14px 16px;
+  transition: .2s ease;
+  box-shadow: 0 8px 24px rgba(0,0,0,.15);
+}
+.card:hover{ background: var(--card-hover); transform: translateY(-2px); }
+
+.metric-wrap .stMetric{
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 8px 14px;
+}
+
+.pills .stButton>button{
+  background: transparent; border:1px solid var(--border); color: var(--text);
+  padding: 6px 12px; border-radius: 999px; cursor:pointer;
+}
+.pills .stButton>button:hover{ border-color: var(--brand2); background: rgba(107,230,181,.10); }
+
+.news-grid{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+@media (max-width: 1000px){ .news-grid{ grid-template-columns: 1fr; } }
+.news-card{
+  background: linear-gradient(180deg, rgba(255,255,255,.08), rgba(255,255,255,.03));
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 10px 14px;
+  min-height: 120px;
+}
+.news-title a{ color: var(--text); text-decoration: none; font-weight: 700; }
+.news-title a:hover{ text-decoration: underline; }
+.news-meta{ color: var(--muted); font-size: .9rem; margin: .15rem 0 .35rem; }
+.news-desc{ color: #e9edf5; opacity: .95; }
+
+.footer {text-align:center; color: var(--muted); font-size: .9rem; padding-top: 10px;}
+hr{ border-color: var(--border) !important; }
+</style>
+""", unsafe_allow_html=True)
+
+# -------------------------
+# 1-D Series Helper (prevents ndarray errors)
+# -------------------------
+def as_1d_float_series(x, index=None) -> pd.Series:
+    arr = np.asarray(x)
+    if arr.ndim > 1:
+        arr = arr.reshape(-1)
+    if index is not None and len(index) == len(arr):
+        return pd.Series(arr, index=index, dtype="float64")
+    return pd.Series(arr, dtype="float64")
+
+# -------------------------
+# NSE Equity Master (robust fetch)
+# -------------------------
+NSE_SUFFIX = ".NS"
+NSE_MASTER_URLS = [
+    "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv",
+    "https://archives.nseindia.com/content/equities/EQUITY_L.csv",
+    "https://www.nseindia.com/content/equities/EQUITY_L.csv",
+]
+NSE_WARMUP_URLS = [
+    "https://www.nseindia.com/",
+    "https://www.nseindia.com/market-data/securities-available-for-trading",
+]
+BROWSER_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Connection": "keep-alive",
+}
+CSV_HEADERS = {**BROWSER_HEADERS, "Accept": "text/csv,*/*;q=0.8",
+               "Referer": "https://www.nseindia.com/market-data/securities-available-for-trading"}
 
 @st.cache_data(show_spinner=False)
-def fetch_history_close(tickers_full, start, end, interval="1d", auto_adjust=True):
-    """Adjusted Close panel for multi-asset analytics."""
-    frames = []
-    for full in tickers_full:
-        try:
-            hist = yf.Ticker(full).history(start=start, end=end, interval=interval, auto_adjust=auto_adjust, actions=False)
-            if not hist.empty and "Close" in hist.columns:
-                root = full.replace(".NS", "").replace(".BO", "")
-                frames.append(hist["Close"].rename(root))
-        except Exception:
-            continue
-    if not frames:
-        return pd.DataFrame()
-    data = pd.concat(frames, axis=1).sort_index()
-    data.index.name = "Date"
-    return data
+def fetch_nse_equity_master() -> pd.DataFrame:
+    last_err = None
+    with requests.Session() as sess:
+        for wurl in NSE_WARMUP_URLS:
+            try: sess.get(wurl, headers=BROWSER_HEADERS, timeout=10)
+            except Exception as e: last_err = e
+        for url in NSE_MASTER_URLS:
+            try:
+                r = sess.get(url, headers=CSV_HEADERS, timeout=15)
+                r.raise_for_status()
+                text = r.text if isinstance(r.text, str) else r.content.decode("utf-8", errors="ignore")
+                df = pd.read_csv(StringIO(text))
+                df = df.rename(columns={c: c.strip() for c in df.columns})
+                df = df[df.get("SYMBOL").notna() & (df["SYMBOL"].astype(str).str.strip() != "")]
+                df["yahoo"] = df["SYMBOL"].astype(str).str.strip() + NSE_SUFFIX
+                name_col = next((c for c in ["NAME OF COMPANY","NAME_OF_COMPANY","NAMEOF COMPANY","NAMEOF_COMPANY"] if c in df.columns), None)
+                disp_name = df[name_col] if name_col else df["SYMBOL"]
+                df["label"] = disp_name.astype(str).str.strip() + " (" + df["yahoo"] + ")"
+                keep = ["label","yahoo","SYMBOL"] + [c for c in ["SERIES","ISIN"] if c in df.columns]
+                return df[keep].sort_values("label").reset_index(drop=True)
+            except Exception as e:
+                last_err = e
+                continue
+    # Return empty df instead of raising -> so news can still show
+    return pd.DataFrame(columns=["label","yahoo","SYMBOL"])
+
+# -------------------------
+# Price / Info / Indicators
+# -------------------------
+@st.cache_data(show_spinner=False)
+def fetch_prices(ticker: str, start: datetime, end: datetime) -> pd.DataFrame:
+    df = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
+    if not df.empty:
+        df = df.rename(columns={"Open":"open","High":"high","Low":"low","Close":"close","Adj Close":"adj_close","Volume":"volume"})
+    return df
 
 @st.cache_data(show_spinner=False)
-def fetch_history_ohlc(ticker_full, start, end, interval="1d", auto_adjust=True):
-    try:
-        hist = yf.Ticker(ticker_full).history(start=start, end=end, interval=interval, auto_adjust=auto_adjust, actions=False)
-        if not hist.empty:
-            hist.index.name = "Date"
-        return hist
-    except Exception:
-        return pd.DataFrame()
+def info_for(ticker: str) -> dict:
+    try: return yf.Ticker(ticker).info or {}
+    except Exception: return {}
+
+def sma(series: pd.Series, window: int) -> pd.Series:
+    s = as_1d_float_series(series, getattr(series, "index", None))
+    return s.rolling(window).mean()
+
+def ema(series: pd.Series, window: int) -> pd.Series:
+    s = as_1d_float_series(series, getattr(series, "index", None))
+    return s.ewm(span=window, adjust=False).mean()
+
+def rsi(series: pd.Series, window: int = 14) -> pd.Series:
+    s = as_1d_float_series(series, getattr(series, "index", None))
+    delta = s.diff()
+    up = delta.where(delta > 0, 0.0)
+    down = (-delta).where(delta < 0, 0.0)
+    roll_up = up.rolling(window=window, min_periods=window).mean()
+    roll_down = down.rolling(window=window, min_periods=window).mean()
+    rs = roll_up / roll_down.replace(0, np.nan)
+    return 100.0 - (100.0 / (1.0 + rs))
+
+# -------------------------
+# Google News (Market-wide)
+# -------------------------
+GOOGLE_NEWS_BASE = "https://news.google.com/rss/search"
+
+def _strip_html(html_text: str) -> str:
+    if not html_text: return ""
+    text = re.sub(r"<[^>]+>", " ", html_text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return unescape(text)
 
 @st.cache_data(show_spinner=False)
-def fast_fundamentals(full_symbol: str):
-    try:
-        t = yf.Ticker(full_symbol)
-        fi = getattr(t, "fast_info", {})
-        return {
-            "currency": getattr(fi, "currency", None) if hasattr(fi, "currency") else (fi.get("currency") if isinstance(fi, dict) else None),
-            "market_cap": getattr(fi, "market_cap", None) if hasattr(fi, "market_cap") else (fi.get("market_cap") if isinstance(fi, dict) else None),
-            "year_high": getattr(fi, "year_high", None) if hasattr(fi, "year_high") else (fi.get("year_high") if isinstance(fi, dict) else None),
-            "year_low": getattr(fi, "year_low", None) if hasattr(fi, "year_low") else (fi.get("year_low") if isinstance(fi, dict) else None),
-            "last_price": getattr(fi, "last_price", None) if hasattr(fi, "last_price") else (fi.get("last_price") if isinstance(fi, dict) else None),
-        }
-    except Exception:
-        return {}
-
-# =============================
-# Yahoo Finance Presets (stay Yahoo-only)
-# =============================
-@st.cache_data(show_spinner=True)
-def load_yahoo_presets():
-    presets = {"NIFTY50": [], "NIFTYBANK": []}
-    try:
-        presets["NIFTY50"] = [s.replace(".NS", "") for s in yf.tickers_nifty50()]
-    except Exception:
-        pass
-    try:
-        presets["NIFTYBANK"] = [s.replace(".NS", "") for s in yf.tickers_niftybank()]
-    except Exception:
-        pass
-    return presets
-
-PRESETS = load_yahoo_presets()
-
-# =============================
-# Sidebar — Universe & Dates
-# =============================
-st.sidebar.header("⭐ Universe & Controls")
-if PRESETS.get("NIFTY50"):
-    st.sidebar.success(f"NIFTY 50 loaded: {len(PRESETS['NIFTY50'])}")
-if PRESETS.get("NIFTYBANK"):
-    st.sidebar.info(f"NIFTY BANK loaded: {len(PRESETS['NIFTYBANK'])}")
-
-exchange = st.sidebar.radio("Exchange", ["NSE (.NS)", "BSE (.BO)"], index=0)
-suffix = ".NS" if "NSE" in exchange else ".BO"
-
-preset_universe = sorted(set(PRESETS.get("NIFTY50", []) + PRESETS.get("NIFTYBANK", [])))
-manual_add = st.sidebar.text_input("Add symbols (comma-separated, e.g., RELIANCE, TCS, SBIN)", value="")
-file_up = st.sidebar.file_uploader("…or upload a CSV with a 'symbol' column", type=["csv"], key="user_csv")
-
-user_syms = []
-if file_up is not None:
-    try:
-        dfu = pd.read_csv(file_up)
-        if "symbol" in dfu.columns:
-            user_syms = [str(s).upper().strip() for s in dfu["symbol"].dropna().unique().tolist()]
-    except Exception:
-        pass
-if manual_add.strip():
-    user_syms.extend([s.strip().upper() for s in manual_add.split(",") if s.strip()])
-
-ALL_COMPANIES = sorted(set(preset_universe + user_syms))
-
-start_date = st.sidebar.date_input("Start Date", dt.date(2024, 1, 1))
-end_date = st.sidebar.date_input("End Date", dt.date.today())
-interval = st.sidebar.selectbox("Interval", ["1d", "1wk", "1mo"], index=0)
-auto_adjust = st.sidebar.toggle("Use Adjusted Prices", value=True, help="Turn off to see raw OHLC without split/dividend adjustments")
-
-selected_symbols = st.sidebar.multiselect("Select companies", ALL_COMPANIES[:800], ALL_COMPANIES[:6] if ALL_COMPANIES else [])
-
-# =============================
-# Guards
-# =============================
-if start_date > end_date:
-    st.error("⚠️ Start date must be before end date.")
-    st.stop()
-if not selected_symbols:
-    st.warning("Select at least one symbol from the sidebar.")
-    st.stop()
-
-full = [add_suffix(t, suffix) for t in selected_symbols]
-
-# =============================
-# Core Data Loads
-# =============================
-with st.spinner("Fetching price data from Yahoo Finance…"):
-    prices = fetch_history_close(full, start_date, end_date, interval=interval, auto_adjust=auto_adjust)
-
-if prices.empty:
-    st.error("No data returned. Try different symbols/date range.")
-    st.stop()
-
-rets = prices.pct_change().dropna(how="all")
-
-# =============================
-# Tabs for 20 Differentiator Features
-# =============================
-T1, T2, T3, T4, T5 = st.tabs([
-    "1) Price & Patterns",
-    "2) Strategies & Alerts",
-    "3) Risk & Portfolio",
-    "4) Fundamentals & Events",
-    "5) Options, Dividends & Reports",
-])
-
-# -------------------------------------------------
-# 1) Price & Patterns (OHLC, Candles, Heatmaps, Network)
-# -------------------------------------------------
-with T1:
-    st.subheader("1) Multi-asset Price View + Novel Visuals")
-    if px:
-        df_prices = prices.reset_index().melt(id_vars="Date", var_name="Ticker", value_name="Price")
-        fig = px.line(df_prices, x="Date", y="Price", color="Ticker", title="Prices Over Time")
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.line_chart(prices)
-
-    st.markdown("**Candlestick + Auto Pattern Detection (per ticker)**")
-    sel_ta = st.selectbox("Pick a ticker", selected_symbols, index=0, key="ta_ohlc")
-    ohlc = fetch_history_ohlc(add_suffix(sel_ta, suffix), start_date, end_date, interval=interval, auto_adjust=auto_adjust)
-    if not ohlc.empty and go is not None:
-        candle = go.Figure(data=[go.Candlestick(x=ohlc.index, open=ohlc["Open"], high=ohlc["High"], low=ohlc["Low"], close=ohlc["Close"], name=sel_ta)])
-        candle.update_layout(title=f"{sel_ta} — OHLC", xaxis_title="Date", yaxis_title="Price")
-        st.plotly_chart(candle, use_container_width=True)
-
-        # Simple pattern: Bullish/Bearish Engulfing & Doji
-        body = (ohlc["Close"] - ohlc["Open"]).abs()
-        range_ = (ohlc["High"] - ohlc["Low"]).replace(0, np.nan)
-        doji = (body / range_) < 0.1
-        prev = ohlc.shift(1)
-        bull_engulf = (ohlc["Close"] > ohlc["Open"]) & (prev["Close"] < prev["Open"]) & (ohlc["Close"] >= prev["Open"]) & (ohlc["Open"] <= prev["Close"])
-        bear_engulf = (ohlc["Close"] < ohlc["Open"]) & (prev["Close"] > prev["Open"]) & (ohlc["Close"] <= prev["Open"]) & (ohlc["Open"] >= prev["Close"])
-        last_marks = pd.DataFrame({"Doji": doji, "BullEngulf": bull_engulf, "BearEngulf": bear_engulf}).dropna(how="all").tail(10)
-        st.dataframe(last_marks[last_marks.any(axis=1)].tail(10))
-
-    st.markdown("**Correlation Heatmap (Returns)**")
-    if px is not None:
-        corr = rets.corr().fillna(0)
-        st.plotly_chart(px.imshow(corr, text_auto=True, aspect="auto", title="Return Correlation Matrix"), use_container_width=True)
-    else:
-        st.dataframe(rets.corr())
-
-    st.markdown("**Correlation Network (novel)**")
-    thr = st.slider("Edge threshold (|corr|)", 0.0, 1.0, 0.6, 0.05)
-    corr = rets.corr().fillna(0)
-    nodes = corr.columns.tolist()
-    # circular layout
-    theta = np.linspace(0, 2*math.pi, len(nodes), endpoint=False)
-    pos = {n: (math.cos(t), math.sin(t)) for n, t in zip(nodes, theta)}
-    edges = [(i, j, corr.loc[i, j]) for i in nodes for j in nodes if i < j and abs(corr.loc[i, j]) >= thr]
-    if go is not None and edges:
-        edge_traces = []
-        for i, j, w in edges:
-            x0, y0 = pos[i]
-            x1, y1 = pos[j]
-            edge_traces.append(go.Scatter(x=[x0, x1], y=[y0, y1], mode="lines", hoverinfo="none", opacity=min(1, abs(w)), showlegend=False))
-        node_trace = go.Scatter(x=[pos[n][0] for n in nodes], y=[pos[n][1] for n in nodes], mode="markers+text", text=nodes, textposition="top center")
-        fig_net = go.Figure(data=edge_traces + [node_trace])
-        fig_net.update_layout(title="Correlation Network", xaxis_visible=False, yaxis_visible=False)
-        st.plotly_chart(fig_net, use_container_width=True)
-
-# -------------------------------------------------
-# 2) Strategies & Alerts (Backtests, Rules, Anomalies)
-# -------------------------------------------------
-with T2:
-    st.subheader("2) Strategy Backtests + Smart Alerts")
-
-    st.markdown("**A. Moving Average Crossover Backtest (per ticker)**")
-    ma_ticker = st.selectbox("Ticker", selected_symbols, key="ma_ticker")
-    short_win = st.number_input("Short MA", min_value=5, max_value=200, value=20, step=1)
-    long_win = st.number_input("Long MA", min_value=10, max_value=400, value=50, step=1)
-    p = prices[ma_ticker].dropna()
-    if len(p) > long_win:
-        sma_s = p.rolling(short_win).mean()
-        sma_l = p.rolling(long_win).mean()
-        signal = (sma_s > sma_l).astype(int)
-        strat_rets = p.pct_change().fillna(0) * signal.shift(1).fillna(0)
-        curve = (1 + strat_rets).cumprod()
-        bench = (p / p.iloc[0])
-        if px is not None:
-            st.plotly_chart(px.line(pd.concat([curve.rename("Strategy"), bench.rename("Buy&Hold")], axis=1), title=f"{ma_ticker}: MA({short_win}/{long_win}) Backtest"), use_container_width=True)
-        st.write({"Strategy CAGR": (curve.iloc[-1] ** (365.25 / max(1,(curve.index[-1]-curve.index[0]).days)) - 1) if len(curve)>1 else np.nan})
-
-    st.markdown("**B. RSI Rules & Alerts (per ticker)**")
-    rsi_ticker = st.selectbox("Ticker for RSI", selected_symbols, key="rsi_ticker")
-    p2 = prices[rsi_ticker].dropna()
-    if len(p2) > 15:
-        delta = p2.diff()
-        gain = delta.clip(lower=0).rolling(14).mean()
-        loss = (-delta.clip(upper=0)).rolling(14).mean()
-        rs = gain / loss.replace(0, np.nan)
-        rsi = 100 - (100 / (1 + rs))
-        overbought = rsi.iloc[-1] >= 70
-        oversold = rsi.iloc[-1] <= 30
-        st.metric("Latest RSI(14)", f"{rsi.iloc[-1]:.2f}", help="Alerts: OB>=70, OS<=30")
-        st.info("Overbought 🚩" if overbought else ("Oversold ✅" if oversold else "Neutral"))
-        if px is not None:
-            st.plotly_chart(px.line(rsi, title=f"{rsi_ticker}: RSI(14)"), use_container_width=True)
-
-    st.markdown("**C. Return Anomalies (Z-Score)**")
-    roll = st.slider("Window (days)", 10, 120, 60)
-    anomalies = {}
-    for c in prices.columns:
-        r = prices[c].pct_change()
-        z = (r - r.rolling(roll).mean()) / (r.rolling(roll).std())
-        if not z.empty and abs(z.iloc[-1]) >= 2:
-            anomalies[c] = float(z.iloc[-1])
-    if anomalies:
-        st.warning(f"Anomaly candidates (|z|≥2): {anomalies}")
-    else:
-        st.caption("No significant anomalies today.")
-
-# -------------------------------------------------
-# 3) Risk & Portfolio (Efficient Frontier, VaR/CVaR, Beta, Monte Carlo)
-# -------------------------------------------------
-with T3:
-    st.subheader("3) Portfolio Analytics & Risk Lab")
-
-    freq = {"1d":252, "1wk":52, "1mo":12}[interval]
-    mu = rets.mean() * freq
-    sigma = rets.cov() * freq
-
-    st.markdown("**A. Efficient Frontier (MPT)**")
-    if len(prices.columns) >= 2 and go is not None:
-        def port_stats(w):
-            w = np.array(w)
-            ret = float(np.dot(w, mu))
-            vol = float(np.sqrt(np.dot(w, np.dot(sigma, w))))
-            sr = ret/vol if vol>0 else np.nan
-            return ret, vol, sr
-        # random portfolios
-        N = 2000
-        Ws = np.random.dirichlet(np.ones(len(mu)), N)
-        pts = np.array([port_stats(w) for w in Ws])
-        figf = go.Figure()
-        figf.add_trace(go.Scatter(x=pts[:,1], y=pts[:,0], mode="markers", name="Random", opacity=0.4))
-        st.plotly_chart(figf.update_layout(title="Efficient Frontier (simulated)", xaxis_title="Volatility", yaxis_title="Return"), use_container_width=True)
-
-    st.markdown("**B. One-click Tangency Portfolio (rf=0)**")
-    if len(prices.columns) >= 2:
+def fetch_google_news(query: str, days: int = 7, lang_region: str = "en-IN", ceid: str = "IN:en", max_items: int = 40) -> pd.DataFrame:
+    q = f"{query} when:{days}d"
+    url = f"{GOOGLE_NEWS_BASE}?q={quote_plus(q)}&hl={lang_region}&gl=IN&ceid={ceid}"
+    headers = {
+        "User-Agent": BROWSER_HEADERS["User-Agent"],
+        "Accept": "application/rss+xml,text/xml;q=0.9,*/*;q=0.8",
+    }
+    r = requests.get(url, headers=headers, timeout=15)
+    r.raise_for_status()
+    root = ET.fromstring(r.content)
+    items = []
+    for item in root.findall("./channel/item"):
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        pub_raw = item.findtext("pubDate")
         try:
-            inv = np.linalg.pinv(sigma.values)
-            ones = np.ones(len(mu))
-            w_tan = inv.dot(mu.values)
-            w_tan = w_tan / w_tan.sum()
-            w_series = pd.Series(w_tan, index=mu.index)
-            st.dataframe((w_series*100).round(2).rename("% Weight"))
-        except Exception:
-            st.caption("Could not compute tangency weights.")
+            pub_dt = parsedate_to_datetime(pub_raw) if pub_raw else None
+            if pub_dt and pub_dt.tzinfo is None: pub_dt = pub_dt.replace(tzinfo=timezone.utc)
+        except Exception: pub_dt = None
+        source = item.findtext("source") or ""
+        desc = item.findtext("description") or ""
+        snippet = _strip_html(desc)
+        items.append({
+            "title": title, "link": link, "provider": source.strip(),
+            "published": pub_dt, "published_str": pub_dt.strftime("%Y-%m-%d %H:%M UTC") if pub_dt else "",
+            "snippet": snippet,
+        })
+        if len(items) >= max_items: break
+    df = pd.DataFrame(items)
+    if not df.empty and "published" in df.columns:
+        df = df.sort_values("published", ascending=False, na_position="last")
+    return df.reset_index(drop=True)
 
-    st.markdown("**C. Risk: VaR & CVaR (parametric)**")
-    alpha = st.slider("Confidence", 0.90, 0.99, 0.95, 0.01)
-    port_w = np.array([1/len(prices.columns)]*len(prices.columns))
-    port_rets = (rets * port_w).sum(axis=1)
-    mu_d = port_rets.mean()
-    sd_d = port_rets.std()
-    from scipy.stats import norm
-    var = -(mu_d + sd_d * norm.ppf(1-alpha))
-    cvar = - (mu_d - sd_d * (norm.pdf(norm.ppf(1-alpha))/(1-alpha)))
-    st.write({"Daily VaR": float(var), "Daily CVaR": float(cvar)})
+# -------------------------
+# Header
+# -------------------------
+hero = st.container()
+with hero:
+    st.markdown(
+        '<div class="app-hero">'
+        '<div class="app-title">📈 Indian Stock Market Tracker</div>'
+        '<div class="subtitle">Built by <b>Shubh Kumar</b> · All NSE companies · Live charts · Market news</div>'
+        '</div>',
+        unsafe_allow_html=True
+    )
 
-    st.markdown("**D. Beta vs NIFTY 50 (Yahoo ^NSEI)**")
-    try:
-        idx = yf.Ticker("^NSEI").history(start=start_date, end=end_date, interval=interval)["Close"].pct_change().dropna()
-        betas = {}
-        for c in prices.columns:
-            r = prices[c].pct_change().dropna()
-            aligned = pd.concat([r, idx], axis=1).dropna()
-            if len(aligned)>5:
-                cov = np.cov(aligned.iloc[:,0], aligned.iloc[:,1])[0,1]
-                betas[c] = float(cov / aligned.iloc[:,1].var()) if aligned.iloc[:,1].var()!=0 else np.nan
-        st.dataframe(pd.Series(betas, name="Beta vs ^NSEI"))
-    except Exception:
-        st.caption("Index fetch failed; beta unavailable.")
+st.write("")  # spacing
 
-    st.markdown("**E. Monte Carlo (GBM) — per ticker**")
-    mc_t = st.selectbox("Ticker for MC", prices.columns, key="mc_t")
-    sims = st.slider("Simulations", 100, 2000, 500, 100)
-    horizon = st.slider("Days ahead", 30, 365, 180, 15)
-    series = prices[mc_t].dropna()
-    if len(series)>5:
-        r = series.pct_change().dropna()
-        mu_g = r.mean()
-        sd_g = r.std()
-        last = series.iloc[-1]
-        rnd = np.random.normal(mu_g, sd_g, (horizon, sims))
-        path = last * (1 + rnd).cumprod(axis=0)
-        mean_path = path.mean(axis=1)
-        if px is not None:
-            st.plotly_chart(px.line(pd.DataFrame({"Mean": mean_path})), use_container_width=True)
-        st.caption("Simple GBM-style simulation for indicative ranges.")
-
-# -------------------------------------------------
-# 4) Fundamentals & Events (Comparatives, Calendar, Sector Rotation)
-# -------------------------------------------------
-with T4:
-    st.subheader("4) Fundamentals & Corporate Events")
-
-    st.markdown("**A. Quick Fundamentals Glance**")
-    cols = st.columns(min(4, len(full)))
-    for i, root in enumerate(prices.columns[:8]):
-        full_sym = add_suffix(root, suffix)
-        fi = fast_fundamentals(full_sym)
-        with cols[i % len(cols)]:
-            st.markdown(f"**{root}**  ")
-            st.caption(full_sym)
-            st.write(f"Last: {fi.get('last_price', '—')} {fi.get('currency','INR') or 'INR'}")
-            st.write(f"52w: {fi.get('year_low','—')} — {fi.get('year_high','—')}")
-            mc = fi.get('market_cap')
-            st.write(f"Mkt Cap: {f'{mc:,.0f}' if isinstance(mc,(int,float)) else '—'}")
-
-    st.markdown("**B. Events Calendar (earnings, dividends, splits) — per ticker**")
-    ev_t = st.selectbox("Ticker for events", prices.columns, key="events_t")
-    T = yf.Ticker(add_suffix(ev_t, suffix))
-    try:
-        div = T.dividends
-    except Exception:
-        div = pd.Series(dtype=float)
-    try:
-        splits = T.splits
-    except Exception:
-        splits = pd.Series(dtype=float)
-    try:
-        cal = T.calendar if hasattr(T, 'calendar') else pd.DataFrame()
-    except Exception:
-        cal = pd.DataFrame()
-    st.write("Dividends (recent):")
-    st.dataframe(div.tail(10))
-    st.write("Splits (recent):")
-    st.dataframe(splits.tail(10))
-    if isinstance(cal, pd.DataFrame) and not cal.empty:
-        st.write("Upcoming/Recent earnings calendar (if available):")
-        st.dataframe(cal)
+# -------------------------
+# Sidebar Controls (styled)
+# -------------------------
+with st.sidebar:
+    st.markdown("### ⚙️ Controls")
+    period = st.selectbox("Period",
+                          options=["1mo","3mo","6mo","1y","2y","5y","10y","ytd","max"],
+                          index=3, help="How far back to load data")
+    end_date = datetime.now()
+    if period == "max":
+        start_date = datetime(1990,1,1)
+    elif period == "ytd":
+        start_date = datetime(end_date.year,1,1)
     else:
-        st.caption("No earnings calendar data available.")
+        qty = int("".join([c for c in period if c.isdigit()]))
+        unit = "".join([c for c in period if c.isalpha()])
+        start_date = end_date - timedelta(days=(30*qty if unit=="mo" else 365*qty))
+    st.markdown("---")
+    show_ma = st.checkbox("SMA 20/50 + EMA 20", value=True)
+    show_rsi = st.checkbox("RSI (14)", value=True)
+    st.markdown("---")
+    st.caption("If NSE blocks the live CSV, upload EQUITY_L.csv below.")
+    _ = st.file_uploader("Upload EQUITY_L.csv (fallback)", type=["csv"])
 
-    st.markdown("**C. Sector Rotation Snapshot (best effort)**")
-    st.caption("Yahoo fast_info may not expose sectors consistently; this is a best-effort grouping if available via .info.")
-    sectors = []
-    for root in prices.columns:
-        try:
-            info = yf.Ticker(add_suffix(root, suffix)).info
-            sectors.append({"Ticker": root, "Sector": info.get("sector", "Unknown")})
-        except Exception:
-            sectors.append({"Ticker": root, "Sector": "Unknown"})
-    sec_df = pd.DataFrame(sectors)
-    st.dataframe(sec_df)
-    if not sec_df.empty:
-        perf = (prices.iloc[-1] / prices.iloc[0] - 1).rename("Return")
-        sec_perf = sec_df.set_index("Ticker").join(perf).groupby("Sector").mean().sort_values("Return", ascending=False)
-        if px is not None:
-            st.plotly_chart(px.bar(sec_perf, y="Return", title="Sector Rotation (avg return)").update_layout(yaxis_tickformat=",.0%"), use_container_width=True)
-        else:
-            st.dataframe(sec_perf)
+# -------------------------
+# Load NSE list (never stops the app)
+# -------------------------
+with st.spinner("Loading all NSE-listed companies…"):
+    nse_list = fetch_nse_equity_master()
+    if nse_list.empty:
+        st.warning("Could not load the NSE company list right now. Charts may be unavailable, but Market News is shown below.")
 
-# -------------------------------------------------
-# 5) Options, Dividends & Export (Chain, Yield, Custom Index)
-# -------------------------------------------------
-with T5:
-    st.subheader("5) Derivatives, Income & Reports")
+# -------------------------
+# Company Selector (card)
+# -------------------------
+st.markdown('<div class="card">', unsafe_allow_html=True)
+left, right = st.columns([0.7, 0.3])
+with left:
+    pick = st.selectbox("🔎 Search company (NSE)",
+                        options=nse_list["label"].tolist() if not nse_list.empty else [],
+                        index=None,
+                        placeholder="Type to search all NSE companies…")
+with right:
+    compare = st.toggle("Compare Mode", value=False)
+st.markdown('</div>', unsafe_allow_html=True)
 
-    st.markdown("**A. Options Chain (if Yahoo provides it)**")
-    opt_t = st.selectbox("Ticker for options", prices.columns, key="opt_t")
+if not compare:
+    symbols = [nse_list.loc[nse_list["label"] == pick, "yahoo"].iloc[0]] if (pick and not nse_list.empty) else []
+else:
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    picks = st.multiselect("➕ Add companies to compare (max 5)",
+                           options=nse_list["label"].tolist() if not nse_list.empty else [],
+                           default=[], max_selections=5,
+                           placeholder="Type to search and add…")
+    st.markdown('</div>', unsafe_allow_html=True)
+    symbols = nse_list.loc[nse_list["label"].isin(picks), "yahoo"].tolist() if not nse_list.empty else []
+
+# -------------------------
+# Charts / Metrics FIRST (if we have symbols)
+# -------------------------
+if symbols:
+    tabs = st.tabs(symbols)
+    for i, sym in enumerate(symbols):
+        with tabs[i]:
+            st.markdown('<div class="card">', unsafe_allow_html=True)
+            st.markdown(f"### {sym}")
+
+            with st.spinner("Fetching data…"):
+                df = fetch_prices(sym, start=start_date, end=end_date + timedelta(days=1))
+                info = info_for(sym)
+
+            if df.empty:
+                st.warning("No data found for this ticker. Try another symbol.")
+                st.markdown('</div>', unsafe_allow_html=True)
+                continue
+
+            # 1-D series
+            s_open = as_1d_float_series(df["open"], df.index)
+            s_high = as_1d_float_series(df["high"], df.index)
+            s_low  = as_1d_float_series(df["low"],  df.index)
+            s_close = as_1d_float_series(df["close"], df.index)
+            s_vol = as_1d_float_series(df.get("volume", []), df.index) if "volume" in df.columns else pd.Series(dtype="float64")
+
+            # Metrics
+            st.markdown('<div class="metric-wrap">', unsafe_allow_html=True)
+            m1, m2, m3, m4 = st.columns(4)
+            last_close = float(s_close.iloc[-1])
+            prev_close = float(s_close.iloc[-2]) if len(s_close) > 1 else last_close
+            pct = ((last_close - prev_close) / prev_close) * 100 if prev_close else 0.0
+            try: high_52w = float(s_close.rolling(252).max().iloc[-1])
+            except Exception: high_52w = float("nan")
+            try: low_52w = float(s_close.rolling(252).min().iloc[-1])
+            except Exception: low_52w = float("nan")
+            last_vol_val = int(s_vol.iloc[-1]) if len(s_vol) and pd.notna(s_vol.iloc[-1]) else 0
+            m1.metric("Last Close", f"{last_close:,.2f}", f"{pct:+.2f}%")
+            m2.metric("52W High", f"{high_52w:,.2f}" if pd.notna(high_52w) else "—")
+            m3.metric("52W Low", f"{low_52w:,.2f}" if pd.notna(low_52w) else "—")
+            m4.metric("Volume (last)", f"{last_vol_val:,}")
+            st.markdown('</div>', unsafe_allow_html=True)
+
+            # Price chart
+            fig = go.Figure()
+            fig.add_trace(go.Candlestick(x=df.index, open=s_open, high=s_high, low=s_low, close=s_close, name="OHLC"))
+            if show_ma:
+                fig.add_trace(go.Scatter(x=df.index, y=s_close.rolling(20).mean(), name="SMA 20"))
+                fig.add_trace(go.Scatter(x=df.index, y=s_close.rolling(50).mean(), name="SMA 50"))
+                fig.add_trace(go.Scatter(x=df.index, y=s_close.ewm(span=20, adjust=False).mean(), name="EMA 20"))
+            fig.update_layout(
+                height=520, margin=dict(l=10,r=10,t=30,b=10),
+                xaxis_title="Date", yaxis_title="Price",
+                legend=dict(orientation="h"),
+                plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)"
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+            # RSI chart
+            if show_rsi:
+                r = rsi(s_close)
+                rfig = go.Figure()
+                rfig.add_trace(go.Scatter(x=df.index, y=r, name="RSI 14"))
+                rfig.add_hline(y=70, line_dash="dot")
+                rfig.add_hline(y=30, line_dash="dot")
+                rfig.update_layout(
+                    height=250, margin=dict(l=10,r=10,t=10,b=10),
+                    plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)"
+                )
+                st.plotly_chart(rfig, use_container_width=True)
+
+            # Company info
+            with st.expander("Company Overview"):
+                c1,c2,c3 = st.columns(3)
+                c1.markdown(f"**Name:** {info.get('longName') or info.get('shortName') or '—'}")
+                c2.markdown(f"**Sector:** {info.get('sector','—')}")
+                c3.markdown(f"**Industry:** {info.get('industry','—')}")
+                c1,c2,c3 = st.columns(3)
+                mc = info.get("marketCap")
+                c1.markdown(f"**Market Cap:** {mc:,.0f}" if mc else "**Market Cap:** —")
+                c2.markdown(f"**PE (TTM):** {info.get('trailingPE','—')}")
+                c3.markdown(f"**Dividend Yield:** {info.get('dividendYield','—')}")
+                st.caption("Data source: Yahoo Finance (some fields may be missing).")
+
+            # Export
+            csv_buf = io.StringIO()
+            df.to_csv(csv_buf)
+            st.download_button("⬇️ Download price data (CSV)", data=csv_buf.getvalue(),
+                               file_name=f"{sym.replace('.', '_')}_prices.csv", mime="text/csv",
+                               use_container_width=True)
+
+            st.markdown('</div>', unsafe_allow_html=True)
+
+# -------------------------
+# Market News (Google) — ALWAYS VISIBLE
+# (renders regardless of symbols or NSE list availability)
+# Auto-includes selected company names with a toggle
+# -------------------------
+base_market_query = "Indian stock market OR Sensex OR Nifty OR NSE OR BSE"
+
+selected_labels = []
+if symbols:
+    # if nse_list loaded, map yahoo→label; else fallback to symbols themselves
     try:
-        tk = yf.Ticker(add_suffix(opt_t, suffix))
-        exps = tk.options
-        if exps:
-            exp = st.selectbox("Expiry", exps, index=0)
-            ch = tk.option_chain(exp)
-            st.write("Calls:")
-            st.dataframe(ch.calls.head(50))
-            st.write("Puts:")
-            st.dataframe(ch.puts.head(50))
-        else:
-            st.caption("No options data available for this symbol.")
+        selected_labels = nse_list.loc[nse_list["yahoo"].isin(symbols), "label"].tolist()
     except Exception:
-        st.caption("Options retrieval failed.")
+        selected_labels = symbols[:]
+selected_names = [lbl.split(" (")[0].strip() for lbl in selected_labels][:3]
 
-    st.markdown("**B. Dividend Tracker & Yield**")
-    div_t = st.selectbox("Ticker for dividends", prices.columns, key="div_t")
+st.markdown('<div class="card">', unsafe_allow_html=True)
+st.markdown("#### 🗞️ Market News (Google)")
+
+c1, c2 = st.columns([0.75, 0.25])
+with c1:
+    auto_include = st.toggle("Include selected companies in news", value=True,
+                             help="When ON, the Google query includes the companies you picked above.")
+with c2:
+    google_days = st.slider("Lookback (days)", 1, 30, 7)
+
+if auto_include and selected_names:
+    company_query = " OR ".join([f'"{name}"' for name in selected_names])
+    smart_default_query = f"({company_query}) OR ({base_market_query})"
+else:
+    smart_default_query = base_market_query
+
+google_query = st.text_input("News query", value=smart_default_query,
+                             help='Tip: You can edit this. Use OR, quotes, e.g., "Infosys" OR "TCS"')
+
+with st.spinner("Fetching Google News…"):
     try:
-        dser = yf.Ticker(add_suffix(div_t, suffix)).dividends
-        if isinstance(dser, pd.Series) and not dser.empty:
-            last_year = dser[dser.index >= (dser.index.max() - pd.Timedelta(days=365))].sum()
-            last_price = prices[div_t].iloc[-1]
-            yield_est = float(last_year / last_price) if last_price and last_year else np.nan
-            st.write({"12m Dividends": float(last_year), "Approx Yield": yield_est})
-            if px is not None:
-                st.plotly_chart(px.bar(dser.tail(20), title=f"{div_t}: Dividend History"), use_container_width=True)
-        else:
-            st.caption("No dividend data.")
-    except Exception:
-        st.caption("Dividend fetch failed.")
+        gdf = fetch_google_news(google_query, days=google_days, lang_region="en-IN", ceid="IN:en", max_items=40)
+    except Exception as e:
+        st.error(f"Could not fetch Google News right now. {e}")
+        gdf = pd.DataFrame()
 
-    st.markdown("**C. Custom Index Builder & Export**")
-    st.caption("Create your own weighted index and backtest instantly.")
-    weights = {}
-    cols = st.columns(min(4, len(prices.columns)))
-    for i, c in enumerate(prices.columns):
-        with cols[i % len(cols)]:
-            weights[c] = st.number_input(f"{c} %", min_value=0.0, max_value=100.0, value=round(100.0/len(prices.columns), 2))
-    w = np.array([weights[c] for c in prices.columns])
-    if w.sum() == 0:
-        w = np.array([1/len(prices.columns)]*len(prices.columns))
-    else:
-        w = w / w.sum()
-    port_curve = (1 + (rets * w).sum(axis=1)).cumprod()
-    if px is not None:
-        st.plotly_chart(px.line(port_curve, title="Custom Index (Base=1.0)"), use_container_width=True)
-    st.download_button("⬇️ Download Custom Index CSV", data=port_curve.rename("CustomIndex").to_csv().encode("utf-8"), file_name="custom_index.csv", mime="text/csv")
+if gdf.empty:
+    st.info("No Google News items found.")
+else:
+    st.markdown('<div class="news-grid">', unsafe_allow_html=True)
+    for _, row in gdf.iterrows():
+        ttl = row["title"]; lnk = row["link"]
+        meta = " · ".join([x for x in [row.get("provider",""), row.get("published_str","")] if x])
+        snip = row.get("snippet", "")
+        st.markdown(
+            f'<div class="news-card">'
+            f'<div class="news-title"><a href="{lnk}" target="_blank">{ttl}</a></div>'
+            f'<div class="news-meta">{meta}</div>'
+            f'<div class="news-desc">{snip}</div>'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+    st.markdown('</div>', unsafe_allow_html=True)
 
-# =============================
-# Extras Section — Unique Add-ons
-# =============================
-with st.expander("📦 Extras: Save/Load Watchlist, Monthly Heatmap, Rolling Metrics"):
-    st.markdown("**Save current selection as watchlist**")
-    csv_buf = StringIO()
-    pd.DataFrame({"symbol": selected_symbols}).to_csv(csv_buf, index=False)
-    st.download_button("Save watchlist CSV", data=csv_buf.getvalue(), file_name="watchlist.csv")
+st.markdown('</div>', unsafe_allow_html=True)
 
-    st.markdown("**Monthly Return Heatmap**")
-    monthly = prices.resample("M").last().pct_change()
-    if not monthly.empty:
-        mh = monthly.copy()
-        mh.index = mh.index.strftime("%Y-%m")
-        if px is not None:
-            st.plotly_chart(px.imshow(mh.T, aspect="auto", title="Monthly Returns", color_continuous_scale="RdBu_r"), use_container_width=True)
-        else:
-            st.dataframe(mh)
-
-    st.markdown("**Rolling Sharpe & Max Drawdown (equal-weight portfolio)**")
-    eq = (rets.mean(axis=1))
-    roll = 63
-    roll_ret = eq.rolling(roll).mean() * 252
-    roll_vol = eq.rolling(roll).std() * np.sqrt(252)
-    rsh = (roll_ret / roll_vol).replace([np.inf, -np.inf], np.nan)
-    curve = (1 + eq).cumprod()
-    dd = curve / curve.cummax() - 1
-    if px is not None:
-        st.plotly_chart(px.line(rsh, title="Rolling Sharpe (~3 months)"), use_container_width=True)
-        st.plotly_chart(px.line(dd, title="Drawdown (Equal-weight)"), use_container_width=True)
-    else:
-        st.line_chart(rsh)
-        st.line_chart(dd)
-
-st.success("Loaded 20+ distinctive analytics and tools. All data sourced from Yahoo Finance via yfinance. Some fundamentals/events may be unavailable for certain tickers.")
+# -------------------------
+# Footer
+# -------------------------
+st.markdown('<hr/>', unsafe_allow_html=True)
+st.markdown(f'<div class="footer">© {datetime.now().year} · Indian Stock Market Tracker · Built by Shubh Kumar</div>', unsafe_allow_html=True)
