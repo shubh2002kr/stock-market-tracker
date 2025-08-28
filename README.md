@@ -14,7 +14,7 @@ An **interactive dashboard** to track **Indian stock markets (NSE-listed compani
 ---
 
 ## 🌐 Live Demo  
-👉 [Click here to use the app](https://stocktracker-4xjzs4grfqbkvd8ucyms3x.streamlit.app/)  
+👉 [Click here to use the app](https://stock-market-tracker-f5qbafnhvzqnrw5snocdcd.streamlit.app/)  
 
 ---
 
