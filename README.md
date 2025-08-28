@@ -4,6 +4,10 @@
 [![Streamlit](https://img.shields.io/badge/Made%20With-Streamlit-FF4B4B?logo=streamlit&logoColor=white)](https://streamlit.io/)  
 [![Python](https://img.shields.io/badge/Python-3.9+-3776AB?logo=python&logoColor=white)](https://www.python.org/)  
 [![Plotly](https://img.shields.io/badge/Charts-Plotly-3DDC84?logo=plotly&logoColor=white)](https://plotly.com/python/)  
+[![yFinance](https://img.shields.io/badge/Data-yFinance-003366?logo=yahoo&logoColor=white)](https://pypi.org/project/yfinance/)  
+[![Pandas](https://img.shields.io/badge/Data-Pandas-150458?logo=pandas&logoColor=white)](https://pandas.pydata.org/)  
+[![NumPy](https://img.shields.io/badge/Data-NumPy-013243?logo=numpy&logoColor=white)](https://numpy.org/)  
+[![Matplotlib](https://img.shields.io/badge/Charts-Matplotlib-11557c?logo=python&logoColor=white)](https://matplotlib.org/)  
 
 An **interactive dashboard** to track **Indian stock markets (NSE-listed companies)** with **live prices, technical indicators, and Google Market News**.  
 
